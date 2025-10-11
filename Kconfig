@@ -2,18 +2,11 @@ source "Kconfig.zephyr"
 
 menu "Hello Timer Configuration"
 
-config HELLOTIMER_INTERVAL
-  int "Hello Timer Interval (msec)"
+config BLINK_TIMER_INTERVAL
+  int "Blink Timer Interval (msec)"
   default 1500
   range 10 600000
   help
-    Sets the interval in miliseconds for the hello_timer handler
-
-config HELLOTIMER_INIT
-  int "Hello Timer Init (msec)"
-  default 0
-  range 0 600000
-  help
-    Sets the interval in milliseconds to call the hello_timer handler for the first time
+    Sets the interval in miliseconds for the blink timer handler
 
 endmenu
