@@ -88,8 +88,7 @@ void filter_thread(void *arg1, void *arg2, void *arg3)
 			s = "TEMP";
 
 			if (data.item < 18 || data.item > 30) {
-				LOG_ERR("Removed invalid data for [%s:%d] from the queue\n", s,
-					data.item);
+				LOG_ERR("Removed invalid data [%s:%d] from queue\n", s, data.item);
 				continue;
 			}
 
@@ -98,8 +97,7 @@ void filter_thread(void *arg1, void *arg2, void *arg3)
 			s = "HUMI";
 
 			if (data.item < 40 || data.item > 70) {
-				LOG_ERR("Removed invalid data for [%s:%d] from the queue\n", s,
-					data.item);
+				LOG_ERR("Removed invalid data [%s:%d] from queue\n", s, data.item);
 				continue;
 			}
 
