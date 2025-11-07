@@ -2,11 +2,25 @@ source "Kconfig.zephyr"
 
 menu "Hello Timer Configuration"
 
-config BLINK_TIMER_INTERVAL
-  int "Blink Timer Interval (msec)"
-  default 1500
-  range 10 600000
+config SNTP_HOSTNAME
+  string "Hostname for SNTP Server"
   help
-    Sets the interval in miliseconds for the blink timer handler
+    Sets the SNTP Server Hostname
+
+config WIFI_SSID
+  string "SSID Wi-Fi connection"
+  help
+    Sets WiFi SSID
+
+config WIFI_PASSWD
+  string "Password Wi-Fi connection"
+    help
+      Sets WiFi password
+
+config LOCAL_TIME
+  int "Locale time converter offset"
+  default 0
+    help
+      Sets Locale time converter like: -3 or +3
 
 endmenu

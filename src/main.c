@@ -1,146 +1,256 @@
+#include "zephyr/net/net_ip.h"
+#include "zephyr/net/socket_service.h"
 #include <stdint.h>
-#include <zephyr/device.h>
+#include <string.h>
+#include <time.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/net/sntp.h>
+#include <zephyr/net/socket.h>
+#include <zephyr/sys/clock.h>
 #include <zephyr/sys/printk.h>
+#include <zephyr/sys/timeutil.h>
+#include <zephyr/toolchain.h>
+#include <zephyr/zbus/zbus.h>
 
-LOG_MODULE_REGISTER(threads_interact);
+LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 
-enum TYPE {
-	TEMP = 0,
-	HUMI
-};
+extern int app_auto_init(void);
+extern bool is_wifi_connected;
 
 struct data {
-	enum TYPE type;
-	int8_t item;
+	struct tm timestamp;
 };
 
-K_MSGQ_DEFINE(consumer_queue, sizeof(struct data), 10, 4);
-K_MSGQ_DEFINE(producer_queue, sizeof(struct data), 10, 4);
+struct endpoint {
+	struct sockaddr addr;
+	socklen_t len;
+};
 
-int8_t get_temp()
+ZBUS_CHAN_DEFINE(time_channel, struct data, NULL, NULL, ZBUS_OBSERVERS(log_subs, app_subs),
+		 ZBUS_MSG_INIT(.timestamp = 0));
+
+K_THREAD_STACK_DEFINE(thread_sntp_stack, 1024);
+K_THREAD_STACK_DEFINE(thread_logger_stack, 1024);
+K_THREAD_STACK_DEFINE(thread_app_stack, 1024);
+
+static struct k_thread thread_sntp_data;
+static struct k_thread thread_logger_data;
+static struct k_thread thread_app_data;
+
+static struct endpoint sntp_endpoint;
+static struct sntp_time s_time;
+static K_SEM_DEFINE(sntp_async_received, 0, 1);
+static void sntp_service_handler(struct net_socket_service_event *pev);
+
+NET_SOCKET_SERVICE_SYNC_DEFINE_STATIC(service_sntp_async, sntp_service_handler, 1);
+
+SYS_INIT(app_auto_init, APPLICATION, 50);
+
+static void sntp_service_handler(struct net_socket_service_event *pev)
 {
-	return (k_cycle_get_32() % 31) + 10;
+	int error;
+
+	error = sntp_read_async(pev, &s_time);
+	if (error) {
+		LOG_ERR("[SNTP] failed to read SNTP response (%d)", error);
+		return;
+	}
+
+	k_sem_give(&sntp_async_received);
 }
 
-int8_t get_humi()
+void logger_thread(void *arg1, void *arg2, void *arg3)
 {
-	return k_cycle_get_32() % 101;
+	int error;
+	char date_time[32] = {0};
+
+	static struct tm internal_clock = {0};
+	const struct zbus_channel *ch;
+	struct data msg;
+
+	LOG_INF("[LOGGER] Starting service");
+
+	while (true) {
+		error = zbus_sub_wait(&log_subs, &ch, K_FOREVER);
+		if (error) {
+			LOG_WRN("[LOGGER] error while waiting channel notification: %d", error);
+			continue;
+		}
+
+		error = zbus_chan_read(ch, &msg, K_NO_WAIT);
+		if (error) {
+			LOG_WRN("[LOGGER] error while reading channel msg: %d", error);
+			continue;
+		}
+
+		internal_clock = msg.timestamp;
+
+		strftime(date_time, 30, "%a %Y-%m-%d %H:%M:%S %Z", &internal_clock);
+		LOG_INF("[LOGGER] Internal clock updated: %s", date_time);
+	}
 }
 
-void prod_thread(void *arg1, void *arg2, void *arg3)
+void app_thread(void *arg1, void *arg2, void *arg3)
+{
+	int error;
+	bool init_ts = false;
+	char date_time[32] = {0};
+
+	const struct zbus_channel *ch;
+	static struct tm last_timestamp = {0};
+	struct data msg;
+
+	LOG_INF("[APP] Starting service");
+
+	while (true) {
+		error = zbus_sub_wait(&app_subs, &ch, K_FOREVER);
+		if (error) {
+			LOG_WRN("[APP] error while waiting channel notification: %d", error);
+			continue;
+		}
+
+		error = zbus_chan_read(ch, &msg, K_NO_WAIT);
+		if (error) {
+			LOG_WRN("[APP] error while reading channel msg: %d", error);
+			continue;
+		}
+
+		strftime(date_time, 30, "%a %Y-%m-%d %H:%M:%S %Z", &last_timestamp);
+		LOG_DBG("[APP] Last execution time: %s", date_time);
+
+		strftime(date_time, 30, "%a %Y-%m-%d %H:%M:%S %Z", &msg.timestamp);
+		LOG_DBG("[APP] Now execution time: %s", date_time);
+
+		if (!init_ts) {
+			last_timestamp = msg.timestamp;
+			init_ts = true;
+		}
+
+		int64_t ta = timeutil_timegm64(&last_timestamp);
+		int64_t tb = timeutil_timegm64(&msg.timestamp);
+		int64_t dt = tb - ta;
+
+		LOG_INF("[APP] Time execution interval: %" PRId64 "s", dt);
+
+		last_timestamp = msg.timestamp;
+	}
+}
+
+void sntp_thread(void *arg1, void *arg2, void *arg3)
 {
 	ARG_UNUSED(arg2);
 	ARG_UNUSED(arg3);
 
-	enum TYPE type = (enum TYPE)(uintptr_t)arg1;
+	LOG_INF("Starting SNTP Service");
 
-	struct data data;
-	while (true) {
-		uint32_t temp_value;
-		char *s;
+	struct endpoint *sntp_endpoint = (struct endpoint *)arg1;
+	struct sntp_ctx ctx;
+	int error;
 
-		switch (type) {
-		case TEMP:
-			temp_value = get_temp();
-			s = "TEMP";
-
-			break;
-		case HUMI:
-			temp_value = get_humi();
-			s = "HUMI";
-
-			break;
-		default:
-			return;
-		}
-
-		LOG_DBG("Put [%s:%d] on queue...\n", s, temp_value);
-
-		data.item = temp_value;
-		data.type = type;
-
-		k_msgq_put(&producer_queue, &data, K_NO_WAIT);
-		k_sleep(K_SECONDS(1));
+	error = sntp_init_async(&ctx, &sntp_endpoint->addr, sntp_endpoint->len,
+				&service_sntp_async);
+	if (error) {
+		LOG_ERR("Failed to init SNTP, ctx: %d", error);
+		sntp_close(&ctx);
 	}
 
-	return;
-}
-
-void filter_thread(void *arg1, void *arg2, void *arg3)
-{
-	ARG_UNUSED(arg1);
-	ARG_UNUSED(arg2);
-	ARG_UNUSED(arg3);
-
-	struct data data;
 	while (true) {
-		int err = k_msgq_get(&producer_queue, &data, K_FOREVER);
-		if (err != 0) {
+		struct tm time_utc;
+
+		k_sem_reset(&sntp_async_received);
+		error = sntp_send_async(&ctx);
+
+		if (error) {
+			LOG_WRN("[SNTP] Failed to send SNTP query (%d)", error);
 			continue;
 		}
 
-		char *s;
-
-		switch (data.type) {
-		case TEMP:
-			s = "TEMP";
-
-			if (data.item < 18 || data.item > 30) {
-				LOG_ERR("Removed invalid data [%s:%d] from queue\n", s, data.item);
-				continue;
-			}
-
-			break;
-		case HUMI:
-			s = "HUMI";
-
-			if (data.item < 40 || data.item > 70) {
-				LOG_ERR("Removed invalid data [%s:%d] from queue\n", s, data.item);
-				continue;
-			}
-
-			break;
-		default:
+		error = k_sem_take(&sntp_async_received, K_MSEC(1000));
+		if (error) {
+			LOG_WRN("[SNTP] response timed out (%d)", error);
 			continue;
 		}
 
-		LOG_DBG("Filtered [%s:%d] from queue\n", s, data.item);
-		k_msgq_put(&consumer_queue, &data, K_NO_WAIT);
+		const struct timespec ts = {
+			.tv_sec = s_time.seconds,
+			.tv_nsec = (long)((((uint64_t)s_time.fraction) * 1000000000ULL) >> 32)};
+
+		sys_clock_settime(CLOCK_REALTIME, &ts);
+
+		uint64_t local_sec = s_time.seconds + (CONFIG_LOCAL_TIME * 3600);
+		gmtime_r(&local_sec, &time_utc);
+
+		char date_time[32] = {0};
+		strftime(date_time, 30, "%a %Y-%m-%d %H:%M:%S %Z-" CONFIG_LOCAL_TIME, &time_utc);
+
+		LOG_INF("[SNTP] Localtime updated: %s", date_time);
+
+		struct data msg = {.timestamp = time_utc};
+		error = zbus_chan_pub(&time_channel, &msg, K_NO_WAIT);
+		if (error) {
+			LOG_WRN("[SNTP] failed to publish in channel");
+		}
+
+		int sleep_time = (k_cycle_get_32() % 2000) + 500;
+
+		k_sleep(K_MSEC(sleep_time));
 	}
+
+	sntp_close_async(&service_sntp_async);
+	sntp_close(&ctx);
 }
 
-void consu_thread(void *arg1, void *arg2, void *arg3)
-{
-	struct data data;
-	while (true) {
-		int err = k_msgq_get(&consumer_queue, &data, K_FOREVER);
-		if (err != 0) {
-			continue;
-		}
-
-		switch (data.type) {
-		case TEMP:
-			LOG_INF("Temperature: %dºC\n", data.item);
-
-			break;
-		case HUMI:
-			LOG_INF("Humidity: %d%%\n", data.item);
-
-			break;
-		default:
-			continue;
-		}
-	}
-}
+ZBUS_SUBSCRIBER_DEFINE(app_subs, 4);
+ZBUS_SUBSCRIBER_DEFINE(log_subs, 4);
 
 int main(void)
 {
+	if (!is_wifi_connected) {
+		LOG_INF("Unable to connect to the WIFI.");
+		return -1;
+	}
+
+	int error;
+	char ipbuf[NET_IPV4_ADDR_LEN];
+
+	struct zsock_addrinfo hints;
+	struct zsock_addrinfo *res;
+
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_DGRAM;
+
+	LOG_INF("Starting system");
+
+	k_sleep(K_SECONDS(2));
+
+	error = zsock_getaddrinfo(CONFIG_SNTP_HOSTNAME, "123", &hints, &res);
+	if (error) {
+		LOG_ERR("Failed to get hostname info");
+		return -1;
+	} else {
+		net_addr_ntop(AF_INET, res->ai_addr, ipbuf, sizeof(ipbuf));
+
+		LOG_INF("DNS SNTP OK: %s -> %s", ipbuf, CONFIG_SNTP_HOSTNAME);
+
+		sntp_endpoint.len = res->ai_addrlen;
+		memcpy(&sntp_endpoint.addr, res->ai_addr, res->ai_addrlen);
+
+		zsock_freeaddrinfo(res);
+	}
+
+	k_thread_create(&thread_sntp_data, thread_sntp_stack,
+			K_THREAD_STACK_SIZEOF(thread_sntp_stack), sntp_thread, &sntp_endpoint, NULL,
+			NULL, K_PRIO_PREEMPT(4), 0, K_NO_WAIT);
+
+	k_thread_create(&thread_logger_data, thread_logger_stack,
+			K_THREAD_STACK_SIZEOF(thread_logger_stack), logger_thread, NULL, NULL, NULL,
+			K_PRIO_PREEMPT(3), 0, K_NO_WAIT);
+
+	k_thread_create(&thread_app_data, thread_app_stack, K_THREAD_STACK_SIZEOF(thread_app_stack),
+			app_thread, NULL, NULL, NULL, K_PRIO_PREEMPT(3), 0, K_NO_WAIT);
+
+	LOG_INF("System started successfully");
+
 	return 0;
 }
-
-K_THREAD_DEFINE(producer1_thread, 1024, prod_thread, TEMP, NULL, NULL, 4, 0, 0);
-K_THREAD_DEFINE(producer2_thread, 1024, prod_thread, HUMI, NULL, NULL, 4, 0, 0);
-K_THREAD_DEFINE(filtering_thread, 1024, filter_thread, NULL, NULL, NULL, 3, 0, 0);
-K_THREAD_DEFINE(consulmer_thread, 1024, consu_thread, NULL, NULL, NULL, 2, 0, 0);
