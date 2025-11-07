@@ -78,7 +78,7 @@ void logger_thread(void *arg1, void *arg2, void *arg3)
 			continue;
 		}
 
-		error = zbus_chan_read(ch, &msg, K_NO_WAIT);
+		error = zbus_chan_read(ch, &msg, K_FOREVER);
 		if (error) {
 			LOG_WRN("[LOGGER] error while reading channel msg: %d", error);
 			continue;
@@ -96,6 +96,8 @@ void app_thread(void *arg1, void *arg2, void *arg3)
 	int error;
 	bool init_ts = false;
 	char date_time[32] = {0};
+	char format[64];
+	snprintf(format, sizeof(format), "%%a %%Y-%%m-%%d %%H:%%M:%%S %%Z%+d", CONFIG_LOCAL_TIME);
 
 	const struct zbus_channel *ch;
 	static struct tm last_timestamp = {0};
@@ -110,16 +112,16 @@ void app_thread(void *arg1, void *arg2, void *arg3)
 			continue;
 		}
 
-		error = zbus_chan_read(ch, &msg, K_NO_WAIT);
+		error = zbus_chan_read(ch, &msg, K_FOREVER);
 		if (error) {
 			LOG_WRN("[APP] error while reading channel msg: %d", error);
 			continue;
 		}
 
-		strftime(date_time, 30, "%a %Y-%m-%d %H:%M:%S %Z", &last_timestamp);
+		strftime(date_time, 30, format, &last_timestamp);
 		LOG_DBG("[APP] Last execution time: %s", date_time);
 
-		strftime(date_time, 30, "%a %Y-%m-%d %H:%M:%S %Z", &msg.timestamp);
+		strftime(date_time, 30, format, &msg.timestamp);
 		LOG_DBG("[APP] Now execution time: %s", date_time);
 
 		if (!init_ts) {
@@ -142,7 +144,8 @@ void sntp_thread(void *arg1, void *arg2, void *arg3)
 	ARG_UNUSED(arg2);
 	ARG_UNUSED(arg3);
 
-	LOG_INF("Starting SNTP Service");
+	char format[64];
+	snprintf(format, sizeof(format), "%%a %%Y-%%m-%%d %%H:%%M:%%S %%Z%+d", CONFIG_LOCAL_TIME);
 
 	struct endpoint *sntp_endpoint = (struct endpoint *)arg1;
 	struct sntp_ctx ctx;
@@ -153,7 +156,11 @@ void sntp_thread(void *arg1, void *arg2, void *arg3)
 	if (error) {
 		LOG_ERR("Failed to init SNTP, ctx: %d", error);
 		sntp_close(&ctx);
+
+		return;
 	}
+
+	LOG_INF("Starting SNTP Service");
 
 	while (true) {
 		struct tm time_utc;
@@ -181,8 +188,8 @@ void sntp_thread(void *arg1, void *arg2, void *arg3)
 		uint64_t local_sec = s_time.seconds + (CONFIG_LOCAL_TIME * 3600);
 		gmtime_r(&local_sec, &time_utc);
 
-		char date_time[32] = {0};
-		strftime(date_time, 30, "%a %Y-%m-%d %H:%M:%S %Z-" CONFIG_LOCAL_TIME, &time_utc);
+		char date_time[32];
+		strftime(date_time, 30, format, &time_utc);
 
 		LOG_INF("[SNTP] Localtime updated: %s", date_time);
 
@@ -192,7 +199,7 @@ void sntp_thread(void *arg1, void *arg2, void *arg3)
 			LOG_WRN("[SNTP] failed to publish in channel");
 		}
 
-		int sleep_time = (k_cycle_get_32() % 2000) + 500;
+		int sleep_time = (k_cycle_get_32() % 5000) + 500;
 
 		k_sleep(K_MSEC(sleep_time));
 	}
