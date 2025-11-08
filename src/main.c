@@ -1,17 +1,9 @@
-#include "zephyr/devicetree.h"
-#include "zephyr/drivers/gpio.h"
-#include "zephyr/init.h"
-#include "zephyr/sys/util.h"
-#include "zephyr/sys/util_macro.h"
-#include "zephyr/toolchain.h"
-#include <stdint.h>
-#include <stdio.h>
 #include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/pwm.h>
-#include <zephyr/drivers/uart.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/sys/printk.h>
 
 LOG_MODULE_REGISTER(hello_world);
 
@@ -26,14 +18,26 @@ static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_NODELABEL(button0)
 static const struct pwm_dt_spec led = PWM_DT_SPEC_GET(DT_ALIAS(led0));
 static struct gpio_callback cb_data;
 
-struct k_timer blink_timer;
-struct k_timer fade_timer;
+static struct k_timer blink_timer;
+static struct k_work blink_work;
 
-static const struct device *const console_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+static struct k_work_delayable fade_work;
+static int32_t fade_bright;
+static int8_t fade_dir;
+static int32_t fade_step_ns;
 
-void blink(struct k_timer *timer_id)
+static volatile bool led_status;
+static volatile enum MODE current_mode;
+
+K_MUTEX_DEFINE(pwm_lock);
+
+static void blink_work_handler(struct k_work *work)
 {
-	static bool led_status = 1;
+	if (current_mode != BLINK) {
+		return;
+	}
+
+	k_mutex_lock(&pwm_lock, K_FOREVER);
 
 	if (led_status) {
 		LOG_DBG("Aceso!");
@@ -42,116 +46,120 @@ void blink(struct k_timer *timer_id)
 		LOG_DBG("Apagado!");
 		pwm_set_pulse_dt(&led, 0);
 	}
+	k_mutex_unlock(&pwm_lock);
+}
 
+static void blink_timer_isr(struct k_timer *timer_id)
+{
+	if (current_mode != BLINK) {
+		return;
+	}
 	led_status = !led_status;
+	k_work_submit(&blink_work);
 }
 
-void fade(struct k_timer *timer_id)
+static void fade_work_handler(struct k_work *work)
 {
-	static int8_t dir = 1;
-	static int32_t bright = 0;
-	static int32_t actual_step = 0;
-
-	bright += (led.period / FADE_STEPS) * dir;
-
-	if (bright > led.period) {
-		bright = led.period;
+	if (current_mode != FADE) {
+		return;
 	}
 
-	pwm_set_pulse_dt(&led, bright);
-
-	bright = MIN(led.period, MAX(0, bright));
-
-	LOG_DBG("PWM Bright: %d%%", (bright * 100) / led.period);
-
-	if (actual_step >= FADE_STEPS) {
-		actual_step = 0;
-		dir *= -1;
-	} else {
-		actual_step++;
+	int32_t b = fade_bright + fade_dir * fade_step_ns;
+	if (b < 0) {
+		b = 0;
 	}
+	if (b > (int32_t)led.period) {
+		b = (int32_t)led.period;
+	}
+
+	k_mutex_lock(&pwm_lock, K_FOREVER);
+	pwm_set_pulse_dt(&led, (uint32_t)b);
+	k_mutex_unlock(&pwm_lock);
+
+	fade_bright = b;
+
+	static int32_t step = 0;
+	LOG_DBG("PWM Bright: %d%%", (fade_bright * 100) / led.period);
+
+	if (++step >= FADE_STEPS) {
+		step = 0;
+		fade_dir = -fade_dir;
+	}
+
+	k_work_reschedule(&fade_work, K_MSEC(20));
 }
 
-void button_cb(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+static void fade_start(void)
 {
-	ARG_UNUSED(dev);
-	ARG_UNUSED(cb);
-	ARG_UNUSED(pins);
+	fade_bright = 0;
+	fade_dir = 1;
+	fade_step_ns = led.period / FADE_STEPS;
+	k_work_init_delayable(&fade_work, fade_work_handler);
+	k_work_schedule(&fade_work, K_NO_WAIT);
+}
 
-	static enum MODE mode = 0;
+static void fade_stop(void)
+{
+	k_work_cancel_delayable(&fade_work);
+}
 
+static void button_cb(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	static enum MODE mode;
 	switch (mode) {
 	case BLINK:
 		k_timer_stop(&blink_timer);
-		k_timer_start(&fade_timer, K_NO_WAIT, K_MSEC(20));
-
+		current_mode = FADE;
+		fade_start();
 		LOG_INF("BLINK -> FADE\n");
 		break;
 	case FADE:
-		k_timer_stop(&fade_timer);
+		fade_stop();
+		current_mode = BLINK;
 		k_timer_start(&blink_timer, K_NO_WAIT, K_MSEC(CONFIG_BLINK_TIMER_INTERVAL));
-
 		LOG_INF("FADE -> BLINK\n");
 		break;
 	}
-
 	mode = !mode;
-	k_msleep(20);
 }
 
 int main(void)
 {
-	int ret = 0;
+	int ret;
+
 	LOG_INF("Starting system....\n");
 
 	if (!gpio_is_ready_dt(&button)) {
-		printk("Error: button device %s is not ready!", button.port->name);
-
 		return 0;
 	}
-
 	if (!pwm_is_ready_dt(&led)) {
-		printk("Error: PWM device %s is not ready\n", led.dev->name);
 		return 0;
 	}
+
+	k_work_init(&blink_work, blink_work_handler);
+	k_timer_init(&blink_timer, blink_timer_isr, NULL);
 
 	ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
-	if (ret != 0) {
-		printk("Error %d: failed to configure %s pin %d\n", ret, button.port->name,
-		       button.pin);
-
-		return 0;
-	}
-
-	ret = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
-	if (ret != 0) {
-		printk("Error: failed to to configure intrreupt on %s pin %d!", button.port->name,
-		       button.pin);
-
+	if (ret) {
 		return 0;
 	}
 
 	gpio_init_callback(&cb_data, button_cb, BIT(button.pin));
 	gpio_add_callback(button.port, &cb_data);
 
-	k_sleep(K_SECONDS(1));
+	ret = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
+	if (ret) {
+		return 0;
+	}
+
+	current_mode = BLINK;
+	led_status = false;
+	k_timer_start(&blink_timer, K_SECONDS(1), K_MSEC(CONFIG_BLINK_TIMER_INTERVAL));
 
 	LOG_INF("Starting blink....\n");
 	LOG_INF("Press button to toggle mode anytime!\n");
 
-	k_timer_init(&fade_timer, fade, NULL);
-	k_timer_init(&blink_timer, blink, NULL);
-	k_timer_start(&blink_timer, K_NO_WAIT, K_MSEC(CONFIG_BLINK_TIMER_INTERVAL));
-
-	char c;
 	while (1) {
-		if (!uart_poll_in(console_dev, &c) && (c == '\n' || c == '\r')) {
-			LOG_DBG("Button Pressed!\n");
-			button_cb(button.port, &cb_data, button.pin);
-		}
-
-		k_msleep(50);
+		k_sleep(K_MSEC(50));
 	}
-
-	return 0;
 }
